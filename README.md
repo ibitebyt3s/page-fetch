@@ -94,11 +94,13 @@ Usage:
 
 Options:
   -c, --concurrency <int>   Concurrency Level (default 2)
+  -d, --delay <int>         Milliseconds to wait between requests (default 0)
   -e, --exclude <string>    Do not save responses matching the provided string (can be specified multiple times)
   -i, --include <string>    Only save requests matching the provided string (can be specified multiple times)
   -j, --javascript <string> JavaScript to run on each page
   -o, --output <string>     Output directory name (default 'out')
   -p, --proxy <string>      Use proxy on given URL
+  -s, --skip-save-response  Do not save responses in general
   -w, --overwrite           Overwrite output files when they already exist
       --no-third-party      Do not save responses to requests on third-party domains
       --third-party         Only save responses to requests on third-party domains

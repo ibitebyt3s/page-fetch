@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -30,11 +31,13 @@ func init() {
 			"",
 			"Options:",
 			"  -c, --concurrency <int>   Concurrency Level (default 2)",
+			"  -d, --delay <int>         Milliseconds to wait between requests (default 0)",
 			"  -e, --exclude <string>    Do not save responses matching the provided string (can be specified multiple times)",
 			"  -i, --include <string>    Only save requests matching the provided string (can be specified multiple times)",
 			"  -j, --javascript <string> JavaScript to run on each page",
 			"  -o, --output <string>     Output directory name (default 'out')",
 			"  -p, --proxy <string>      Use proxy on given URL",
+			"  -s, --skip-save-response  Do not save responses in general",
 			"  -w, --overwrite           Overwrite output files when they already exist",
 			"      --no-third-party      Do not save responses to requests on third-party domains",
 			"      --third-party         Only save responses to requests on third-party domains",
@@ -46,15 +49,18 @@ func init() {
 }
 
 type options struct {
-	includes       listArg
-	excludes       listArg
-	thirdPartyOnly bool
-	noThirdParty   bool
-	overwrite      bool
-	output         string
-	concurrency    int
-	js             string
-	proxy          string
+	includes         listArg
+	excludes         listArg
+	thirdPartyOnly   bool
+	noThirdParty     bool
+	overwrite        bool
+	skipSaveResponse bool
+	scrapeLinks      bool
+	output           string
+	concurrency      int
+	delay            int
+	js               string
+	proxy            string
 }
 
 func main() {
@@ -67,6 +73,11 @@ func main() {
 	flag.Var(&opts.excludes, "exclude", "")
 	flag.Var(&opts.excludes, "e", "")
 
+	flag.BoolVar(&opts.scrapeLinks, "scrape", false, "")
+
+	flag.BoolVar(&opts.skipSaveResponse, "skip-save-response", false, "")
+	flag.BoolVar(&opts.skipSaveResponse, "s", false, "")
+
 	flag.BoolVar(&opts.thirdPartyOnly, "third-party", false, "")
 	flag.BoolVar(&opts.noThirdParty, "no-third-party", false, "")
 
@@ -78,6 +89,9 @@ func main() {
 
 	flag.IntVar(&opts.concurrency, "concurrency", 2, "")
 	flag.IntVar(&opts.concurrency, "c", 2, "")
+
+	flag.IntVar(&opts.delay, "delay", 0, "")
+	flag.IntVar(&opts.delay, "d", 0, "")
 
 	flag.StringVar(&opts.js, "j", "", "")
 	flag.StringVar(&opts.js, "javascript", "", "")
@@ -106,6 +120,15 @@ func main() {
 		copts = append(copts, chromedp.ProxyServer(opts.proxy))
 	}
 
+	// bypass chrome headless detection
+	copts = append(copts,
+		chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0"),
+		chromedp.WindowSize(1920, 1080),
+		chromedp.NoFirstRun,
+		chromedp.NoDefaultBrowserCheck,
+		chromedp.Headless,
+		chromedp.DisableGPU)
+
 	ectx, ecancel := chromedp.NewExecAllocator(context.Background(), copts...)
 	defer ecancel()
 
@@ -128,6 +151,7 @@ func main() {
 	for i := 0; i < opts.concurrency; i++ {
 		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			for requestURL := range jobs {
 
 				ctx, cancel := context.WithTimeout(pctx, time.Second*10)
@@ -142,25 +166,64 @@ func main() {
 					jsCode = "false"
 				}
 
+				hrefCode := "false"
+				if opts.scrapeLinks {
+					hrefCode = "JSON.stringify([...document.querySelectorAll('a')].map(n => n.href))"
+				}
+
+				actionCode := "false"
+				if opts.scrapeLinks {
+					actionCode = "JSON.stringify([...document.querySelectorAll('form')].map(n => n.action))"
+				}
+
 				var jsOutput interface{}
+				var hrefOutput interface{}
+				var actionOutput interface{}
 				err := chromedp.Run(
 					ctx,
 					fetch.Enable().WithPatterns([]*fetch.RequestPattern{{RequestStage: fetch.RequestStageResponse}}),
 					chromedp.Navigate(requestURL),
 					chromedp.EvaluateAsDevTools(jsCode, &jsOutput),
+					chromedp.EvaluateAsDevTools(hrefCode, &hrefOutput),
+					chromedp.EvaluateAsDevTools(actionCode, &actionOutput),
 				)
 
 				if opts.js != "" {
 					fmt.Printf("JS (%s): %v\n", requestURL, jsOutput)
 				}
 
+				if opts.scrapeLinks {
+					// log hrefOutput
+					var jsLinks []interface{}
+					json.Unmarshal([]byte(fmt.Sprint(hrefOutput)), &jsLinks)
+					for _, element := range jsLinks {
+						subRequestUrl := fmt.Sprint(element)
+						if !isThirdPartyUrl(requestURL, subRequestUrl) && len(subRequestUrl) > 0 {
+							fmt.Printf("HREF %v\n", element)
+						}
+					}
+
+					json.Unmarshal([]byte(fmt.Sprint(actionOutput)), &jsLinks)
+					for _, element := range jsLinks {
+						subRequestUrl := fmt.Sprint(element)
+						if !isThirdPartyUrl(requestURL, subRequestUrl) && len(subRequestUrl) > 0 {
+							fmt.Printf("HREF %v\n", element)
+						}
+					}
+				}
+
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "run error: %s\n", err)
 				}
 
+				if opts.delay > 0 {
+					sleepDuration := time.Duration(opts.delay)
+					time.Sleep(sleepDuration * time.Millisecond)
+				}
+
 				cancel()
 			}
-			wg.Done()
+
 		}()
 	}
 	for sc.Scan() {
@@ -265,6 +328,20 @@ func saveMeta(path string, parentURL string, ev *fetch.EventRequestPaused) error
 	return ioutil.WriteFile(path, b.Bytes(), 0644)
 }
 
+func isThirdPartyUrl(requestURL string, subRequestUrl string) bool {
+	var domain string
+	if u, err := url.Parse(requestURL); err == nil {
+		domain = u.Hostname()
+	}
+
+	var subRequestDomain string
+	if u, err := url.Parse(subRequestUrl); err == nil {
+		subRequestDomain = u.Hostname()
+	}
+
+	return isThirdParty(domain, subRequestDomain)
+}
+
 func shouldSave(ev *fetch.EventRequestPaused, requestURL string, opts options) bool {
 
 	contentType := "unknown"
@@ -333,31 +410,37 @@ func makeListener(ctx context.Context, requestURL string, opts options) func(int
 					return
 				}
 
+				body := "none"
+				if ev.Request.HasPostData {
+					body = ev.Request.PostData
+				}
+
 				err := chromedp.Run(
 					ctx,
 					chromedp.ActionFunc(func(ctx context.Context) error {
-						data, err := fetch.GetResponseBody(ev.RequestID).Do(ctx)
-						if err != nil {
-							// this function always has to return a nil error
-							// otherwise the ContinueRequest does not run
-							return nil
-						}
+						if !opts.skipSaveResponse {
+							data, err := fetch.GetResponseBody(ev.RequestID).Do(ctx)
+							if err != nil {
+								// this function always has to return a nil error
+								// otherwise the ContinueRequest does not run
+								return nil
+							}
 
-						path, err := saveResponse(ev.Request.URL, data, opts.output, opts.overwrite)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "failed to save response data for %s: %s\n", ev.Request.URL, err)
-							return nil
-						}
+							path, err := saveResponse(ev.Request.URL, data, opts.output, opts.overwrite)
+							if err != nil {
+								fmt.Fprintf(os.Stderr, "failed to save response data for %s: %s\n", ev.Request.URL, err)
+								return nil
+							}
 
-						// save the headers etc in a separate file
-						err = saveMeta(path+".meta", requestURL, ev)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "failed to save response meta data for %s: %s\n", ev.Request.URL, err)
-							return nil
+							// save the headers etc in a separate file
+							err = saveMeta(path+".meta", requestURL, ev)
+							if err != nil {
+								fmt.Fprintf(os.Stderr, "failed to save response meta data for %s: %s\n", ev.Request.URL, err)
+								return nil
+							}
 						}
-
 						// Log the request
-						fmt.Printf("%s %s %d %s\n", ev.Request.Method, ev.Request.URL, ev.ResponseStatusCode, contentType)
+						fmt.Printf("%s %s %d %s %s\n", ev.Request.Method, ev.Request.URL, ev.ResponseStatusCode, strings.ReplaceAll(contentType, " ", ""), url.QueryEscape(body)) // replace spaces for easier awk
 
 						return nil
 					}),
